@@ -1,0 +1,219 @@
+import re
+from typing import List, Dict, Any
+
+import pandas as pd
+import yaml
+
+# === File paths (change if needed) ===
+BIBLE_FILE = "source_test_bible.yaml"
+INPUT_EXCEL = "input_communications.xlsx"
+OUTPUT_EXCEL = "output_findings.xlsx"
+
+
+# ========== 1. Load rules from YAML ==========
+
+def load_rules(path: str) -> List[Dict[str, Any]]:
+    """Load rules from source_test bible."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    rules = data.get("rules", [])
+    # Normalise missing lists so code doesn't break
+    for r in rules:
+        r.setdefault("positive_patterns", [])
+        r.setdefault("negative_patterns", [])
+    return rules
+
+
+# ========== 2. Chunking helpers ==========
+
+def split_into_sentences(text: str) -> List[str]:
+    """
+    Very simple sentence splitter based on punctuation.
+    For more accuracy you can later replace with NLTK or spaCy.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # Split on ., !, ? followed by space
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in sentences if s.strip()]
+
+
+def chunk_text(
+    text: str,
+    max_words: int = 250,
+    overlap_sentences: int = 1
+) -> List[str]:
+    """
+    Break a long text into overlapping chunks of ~max_words.
+    Chunks are built from sentences with a sentence-overlap.
+    """
+    sentences = split_into_sentences(text)
+    if not sentences:
+        return []
+
+    chunks: List[str] = []
+    i = 0
+
+    while i < len(sentences):
+        current: List[str] = []
+        word_count = 0
+        j = i
+
+        while j < len(sentences) and word_count <= max_words:
+            current.append(sentences[j])
+            word_count += len(sentences[j].split())
+            j += 1
+
+        chunk = " ".join(current).strip()
+        if chunk:
+            chunks.append(chunk)
+
+        # Move index forward with overlap
+        if j >= len(sentences):
+            break
+        i = max(j - overlap_sentences, i + 1)
+
+    return chunks
+
+
+def create_chunked_dataframe(
+    df: pd.DataFrame,
+    text_col: str = "Text",
+    max_words: int = 250,
+    overlap_sentences: int = 1
+) -> pd.DataFrame:
+    """
+    Take the raw Excel dataframe and return a new dataframe
+    with one row per (Message_ID, Chunk_ID).
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        base = row.to_dict()
+        raw_text = str(row.get(text_col, "") or "").strip()
+
+        # Skip empty rows
+        if not raw_text:
+            continue
+
+        word_len = len(raw_text.split())
+
+        # Short messages → single chunk
+        if word_len <= max_words:
+            base["Chunk_ID"] = 1
+            base["Text_Chunk"] = raw_text
+            rows.append(base)
+        else:
+            # Long messages → sentence-based chunks
+            chunks = chunk_text(
+                raw_text,
+                max_words=max_words,
+                overlap_sentences=overlap_sentences,
+            )
+            for idx, ch in enumerate(chunks, start=1):
+                new_row = dict(base)
+                new_row["Chunk_ID"] = idx
+                new_row["Text_Chunk"] = ch
+                rows.append(new_row)
+
+    return pd.DataFrame(rows)
+
+
+# ========== 3. Rule matching ==========
+
+def find_rule_matches(
+    chunk_df: pd.DataFrame,
+    rules: List[Dict[str, Any]],
+    text_col: str = "Text_Chunk"
+) -> pd.DataFrame:
+    """
+    Apply all rules to each chunk of text and collect matches.
+    """
+    results: List[Dict[str, Any]] = []
+
+    for _, row in chunk_df.iterrows():
+        text = str(row.get(text_col, "") or "")
+        if not text:
+            continue
+
+        lower_text = text.lower()
+
+        for rule in rules:
+            rule_id = rule.get("id")
+            theme = rule.get("theme")
+            sub_theme = rule.get("sub_theme")
+            severity = rule.get("severity")
+
+            pos_patterns = [p.lower() for p in rule.get("positive_patterns", [])]
+            neg_patterns = [n.lower() for n in rule.get("negative_patterns", [])]
+
+            matched_pattern = None
+
+            # Check positive patterns (simple substring match)
+            for p in pos_patterns:
+                if p and p in lower_text:
+                    matched_pattern = p
+                    break
+
+            if not matched_pattern:
+                continue
+
+            # Check negative patterns to filter obvious false positives
+            if any(n and n in lower_text for n in neg_patterns):
+                continue
+
+            result: Dict[str, Any] = {
+                "Message_ID": row.get("Message_ID"),
+                "Chunk_ID": row.get("Chunk_ID"),
+                "Rule_ID": rule_id,
+                "Theme": theme,
+                "Sub_Theme": sub_theme,
+                "Severity": severity,
+                "Matched_Pattern": matched_pattern,
+                "Text_Chunk": text,
+            }
+
+            # Optional metadata if present in input
+            for meta_col in ["Date", "Sender", "Receiver", "Channel"]:
+                if meta_col in row:
+                    result[meta_col] = row.get(meta_col)
+
+            results.append(result)
+
+    return pd.DataFrame(results)
+
+
+# ========== 4. Main entrypoint ==========
+
+def main():
+    print("🔍 Loading rules from", BIBLE_FILE)
+    rules = load_rules(BIBLE_FILE)
+    print(f"   Loaded {len(rules)} rules.")
+
+    print("📥 Loading input Excel:", INPUT_EXCEL)
+    df = pd.read_excel(INPUT_EXCEL)
+    print(f"   Loaded {len(df)} messages.")
+
+    print("✂️  Chunking text into smaller units...")
+    chunk_df = create_chunked_dataframe(
+        df,
+        text_col="Text",         # change if your column name is different
+        max_words=250,
+        overlap_sentences=1,
+    )
+    print(f"   Created {len(chunk_df)} chunks.")
+
+    print("🧮 Applying rules on each chunk...")
+    matches_df = find_rule_matches(chunk_df, rules)
+    print(f"   Found {len(matches_df)} rule hits.")
+
+    print("📤 Saving output to", OUTPUT_EXCEL)
+    matches_df.to_excel(OUTPUT_EXCEL, index=False)
+    print("✅ Done. Review", OUTPUT_EXCEL, "for identified findings.")
+
+
+if __name__ == "__main__":
+    main()
