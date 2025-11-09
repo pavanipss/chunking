@@ -1,0 +1,123 @@
+# ============================================================
+# 🎯 GOAL
+# ============================================================
+You are my enterprise GenAI developer inside Copilot.
+Reproduce **Step 3 of the Behavioral Compliance Architecture**:
+a Python pipeline that integrates the local Rule Engine (Step 1) +
+Gemini reasoning (Step 2) using **Vertex AI Managed SDK** 
+with **Application Default Credentials (ADC)** authentication.
+
+# ============================================================
+# 📘 CONTEXT — ARCHITECTURE OVERVIEW
+# ============================================================
+Input Data Source (chat/email/social text from Excel)
+        │
+        ▼
+Step 1 — Rule Engine (Regex / YAML Bible)
+        │
+        ▼
+Auto-Labeled (High-Confidence)  Gray-Zone (Unresolved)
+        │                   │
+        ▼                   ▼
+Save → Final CSV         → Step 2 — Gemini Model (LLM reasoning)
+                                             │
+                                             ▼
+                                 Combined Output → SME Dashboard / Excel
+
+You are now implementing **Step 3 – Vertex AI Managed Gemini Pipeline**
+to automate Steps 1 + 2 with enterprise authentication.
+
+# ============================================================
+# 🧾 INPUT SOURCES
+# ============================================================
+1. **behavior_bible.yaml** — YAML rule bible
+   Each rule has:
+   - id, label, severity, patterns[], explanation
+2. **communication_data.xlsx** — Excel file
+   - Columns: ID, TEXT
+   - Each row = one chat/email/social message
+
+# ============================================================
+# 🧩 TASK
+# ============================================================
+Generate a full Python script that:
+1️⃣ Authenticates automatically using ADC (no API key)  
+2️⃣ Implements a local regex Rule Engine that:
+  • Loads rules from behavior_bible.yaml  
+  • Matches patterns in TEXT  
+  • Returns {label, severity, explanation, policy_recommendation}  
+3️⃣ Calls **Vertex AI Gemini** for unresolved gray-zone records:  
+  • Uses `vertexai.preview.language_models.TextGenerationModel`  
+  • Model name = "gemini-1.5-pro" (or gemini-2.0-pro when available)  
+  • Temperature = 0.0, max_output_tokens = 1500  
+  • Prompt template loaded from behavior_prompts.txt  
+  • Replaces `{data_as_json_string}` placeholder with records JSON  
+  • Batch size = 40  
+4️⃣ Parses Gemini JSON output and appends to results  
+5️⃣ Combines local and Gemini outputs into one DataFrame → return  
+
+# ============================================================
+# 💻 REQUIREMENTS
+# ============================================================
+- Auto-discovery of credentials via ADC (service account or `gcloud auth application-default login`)
+- No `api_key` in code
+- Imports → `re`, `json`, `asyncio`, `pandas`, `yaml`
+- Vertex AI SDK → `google-cloud-aiplatform`, `vertexai`
+- Optional → `pydantic-ai` governed wrapper version
+
+# ============================================================
+# 🧱 EXPECTED CODE STRUCTURE
+# ============================================================
+```python
+import re, json, asyncio, pandas as pd
+from vertexai.preview.language_models import TextGenerationModel
+from behavior_bible import rules
+from schemas import ModelOutput
+
+BATCH_SIZE = 40
+
+def apply_rule_engine(text):
+    for rule in rules:
+        for pat in rule["patterns"]:
+            if re.search(pat, text):
+                return {
+                    "label": rule["label"],
+                    "severity": rule["severity"],
+                    "explanation": rule["explanation"],
+                    "policy_recommendation": "BLOCK" if rule["severity"]=="HIGH" else "ALLOW"
+                }
+    return None
+
+async def call_gemini(prompt: str):
+    model = TextGenerationModel.from_pretrained("gemini-1.5-pro")
+    response = model.predict(prompt, temperature=0.0, max_output_tokens=1500)
+    return response.text
+
+async def process_pipeline(df: pd.DataFrame):
+    gemini_inputs = []
+    results = []
+
+    for _, row in df.iterrows():
+        rule_out = apply_rule_engine(row["TEXT"])
+        if rule_out:
+            results.append({"id": row["ID"], **rule_out})
+        else:
+            gemini_inputs.append(row)
+
+    print(f"Local rule engine labeled {len(results)} records.")
+    print(f"Sending {len(gemini_inputs)} ambiguous records to Gemini...")
+
+    if gemini_inputs:
+        template = open("behavior_prompts.txt").read()
+        for i in range(0, len(gemini_inputs), BATCH_SIZE):
+            batch = gemini_inputs[i:i+BATCH_SIZE]
+            records = [{"id": str(r["ID"]), "text": r["TEXT"]} for _, r in batch.iterrows()]
+            prompt = template.replace("{data_as_json_string}", json.dumps(records))
+            raw = await asyncio.to_thread(call_gemini, prompt)
+            try:
+                parsed = json.loads(raw)
+                results.extend(parsed)
+            except Exception as e:
+                print("Parse error", e)
+
+    return pd.DataFrame(results)
